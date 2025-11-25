@@ -36,10 +36,9 @@ from protocol_proxy.ipc import ProtocolProxyMessage, ProtocolProxyPeer, callback
 from protocol_proxy.manager.gevent import GeventProtocolProxyManager
 
 from volttron.platform.vip.agent import errors
-from volttron.driver.base.config import PointConfig, RemoteConfig
+from volttron.driver.base.config import empty_str_is, PointConfig, RemoteConfig
 from volttron.driver.base.driver_exceptions import DriverConfigError
 from volttron.driver.base.interfaces import BaseInterface, BaseRegister
-from volttron.platform.jsonrpc import RemoteError
 
 _log = logging.getLogger(__name__)
 
