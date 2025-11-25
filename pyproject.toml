@@ -26,7 +26,8 @@ classifiers = [
 python = ">=3.10,<4.0"
 volttron-lib-base-driver = {path= "../volttron-lib-base-driver", develop=true}
 bacpypes3 = ">=0.0.102"
-protocol-proxy-bacnet = ">=2.0.0rc0"
+protocol-proxy = {path= "../lib-protocol-proxy", develop=true}
+protocol-proxy-bacnet = {path= "../lib-protocol-proxy-bacnet", develop=true}
 
 [tool.poetry.group.docs.dependencies]
 Sphinx = "^4.5.0"
