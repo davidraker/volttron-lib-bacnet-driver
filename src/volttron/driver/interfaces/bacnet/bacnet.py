@@ -57,9 +57,9 @@ BACNET_TYPE_MAPPING = {  # TODO: Update with additional types.
 
 class BacnetPointConfig(PointConfig):
     array_index: Annotated[int | None, empty_str_is(None)] = None
-    object_type: str = Field(validation_alias=AliasChoices('Object Type','BACnet Object Type', 'bacnet_object_type'))
+    object_type: str = Field(validation_alias=AliasChoices('object_type', 'Object Type','BACnet Object Type', 'bacnet_object_type'))
     property: Annotated[str, empty_str_is('present-value')] = Field(alias='Property', default='present-value')  # TODO: Should be an Enum of BACnet property types.
-    instance: int = Field(validation_alias=AliasChoices('Instance', 'Index', 'index'))
+    instance: int = Field(validation_alias=AliasChoices('instance','Instance', 'Index', 'index'))
     cov_flag: Annotated[bool, empty_str_is(False)] = Field(default=False, alias='COV Flag')
     write_priority: Annotated[int, empty_str_is(16)] = Field(default=16, ge=1, le=16, alias='Write Priority')
 
@@ -315,6 +315,7 @@ class BACnet(BaseInterface):
                                          }).encode('utf8'),
                                          response_expected=True
                                      )).get(timeout=self.config.timeout).decode('utf8')
+            # TODO: Check if this is an AsyncResult before calling get().
             #_log.debug(f"RESPONSE IS: {response}")
             response = json.loads(response)
             result_dict = response.get('result', {})
