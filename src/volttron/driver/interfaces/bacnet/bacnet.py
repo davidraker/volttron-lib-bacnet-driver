@@ -25,7 +25,7 @@
 import json
 import logging
 
-from collections.abc import KeysView
+from collections.abc import Iterable, KeysView
 from datetime import datetime, timedelta
 from gevent import Timeout
 from gevent.event import AsyncResult
@@ -66,7 +66,7 @@ class BacnetPointConfig(PointConfig):
 
 class BacnetRemoteConfig(RemoteConfig):
     # TODO: Confirm this is not needed now that it is added to superclass: model_config = ConfigDict(populate_by_name=True)
-    bacnet_port_configured: int = Field(default=0)
+    bacnet_port_configured: int = Field(default=0, alias='bacnet_port')
     cov_lifetime_configured: float = Field(default=180.0, alias='cov_lifetime')  # TODO: Can this by by point instead?
     device_id: int = Field(ge=0)
     local_interface: IPvAnyInterface = Field(default='0.0.0.0/32')  # TODO: We should attempt to discover the interface.
@@ -118,7 +118,7 @@ class BacnetRemoteConfig(RemoteConfig):
 
     @bacnet_port.setter
     def bacnet_port(self, v):
-        self.cov_lifetime_configured = int(v)
+        self.bacnet_port_configured = int(v)
 
 class BACnetRegister(BaseRegister):
 
@@ -162,9 +162,8 @@ class BACnet(BaseInterface):
         self.time_synchronization_active = False
 
         self.ppm.register_callback(self.receive_cov, 'RECEIVE_COV', provides_response=False)
-        self.ppm.start()  # TODO: Does this and/or select_loop spawn need to be in finalize_setup? (If not, keep here.)
+        self.ppm.start()
         self.driver_agent.core.spawn(self.ppm.select_loop)
-        #_log.debug('AFTER BACNET INTERFACE INIT')
 
     @property
     def register_count(self):
@@ -175,7 +174,8 @@ class BACnet(BaseInterface):
         #  It could be called on every remote after the end of a setup loop, possibly?
         #_log.debug('BACnet finalize_setup called.')
         self.proxy_peer = self.ppm.get_proxy((str(self.config.local_interface), self.config.bacnet_port),
-                                             local_interface=str(self.config.local_interface))
+                                             local_interface=str(self.config.local_interface),
+                                             bacnet_port=self.config.bacnet_port)
         _log.debug('BACnet finalize_setup: proxy_peer is: %s', self.proxy_peer)
         if initial_setup:
             self.ppm.wait_peer_registered(self.proxy_peer, self.config.timeout, self.ping_target)
@@ -238,17 +238,44 @@ class BACnet(BaseInterface):
         if not pinged:
             self.schedule_ping()
 
+    def parse_proxy_response(self, response: Any, error_keys: Iterable[str]) -> tuple[Any, dict]:
+        """Normalize a reply from the BACnet Proxy into ``(result, errors)``.
+
+        ``ProtocolProxyManager.send`` returns an AsyncResult when a response is expected, or False when the
+        request could not be sent (e.g., the proxy process has not registered). The proxy itself replies with
+        ``{'result': ..., 'error': {...}}`` from its serializer, with ``{'status': 'error', 'error': ..., 'method': ...}``
+        when the endpoint raised or timed out, or with an empty body when the endpoint returned nothing.
+        Whole-request failures are reported against every key in ``error_keys`` (normally the affected topics).
+        A gevent Timeout waiting on the AsyncResult is left to propagate to the caller.
+        """
+        error_keys = list(error_keys)
+
+        def failed(message: str) -> tuple[dict, dict]:
+            return {}, {key: message for key in error_keys}
+
+        if not isinstance(response, AsyncResult):
+            return failed(f'Unable to send request to BACnet Proxy (send returned {response!r}).')
+        raw = response.get(timeout=self.config.timeout)
+        if not raw:
+            return failed('Empty response from BACnet Proxy.')
+        try:
+            payload = json.loads(raw.decode('utf8'))
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            return failed(f'Undecodable response from BACnet Proxy: {e}')
+        if not isinstance(payload, dict):
+            return failed(f'Unexpected response from BACnet Proxy: {payload!r}')
+        if payload.get('status') == 'error':
+            return failed(f"BACnet Proxy {payload.get('method', 'request')} failed: {payload.get('error')}")
+        return payload.get('result', {}), payload.get('error') or {}
+
     def _parse_scalar_response(self, response: Any, topic: str, operation: str) -> Any:
-        response_value = (json.loads(response.get(timeout=self.config.timeout).decode('utf8'))
-                    if isinstance(response, AsyncResult) else {'result': {}, 'error': {topic: response}})
-        #_log.debug(f'response_value is a {type(response_value)}: {response_value}')
-        if (result := response_value.get('result')) != {}:
-            #_log.debug(f'IF BLOCK, RESULT IS: {result}')
+        result, errors = self.parse_proxy_response(response, [topic])
+        if result != {}:
             return result
-        elif (error := response_value.get('error')) != {}:
-            msg = f'Error {operation} point: {topic} --- {error}'
+        elif errors:
+            msg = f'Error {operation} point: {topic} --- {errors.get(topic, errors)}'
         else:
-            msg = f'Unknown error {operation} point: {topic}. Response from proxy was: {response_value}'
+            msg = f'Unknown error {operation} point: {topic}. Response from proxy was empty.'
         _log.warning(msg)
         raise RuntimeError(msg)
 
@@ -302,30 +329,30 @@ class BACnet(BaseInterface):
         # TODO: Manner of packing and unpacking this request needs to be rethought.
         point_map = {t: self._query_fields(self.point_map[t]) for t in topics if t in self.point_map}
         result_dict, error_dict = {}, {}
-        # while True:
+        if not point_map:
+            return result_dict, error_dict
+        # TODO: max_per_request could probably be detected from the device rather than only configured.
+        batch_size = self.config.max_per_request if self.config.max_per_request > 0 else len(point_map)
+        items = list(point_map.items())
         try:
-            # TODO:
-            #  Need to honor self.config.max_per_request, and probably detect it.
-            response = self.ppm.send(self.proxy_peer,
-                                     ProtocolProxyMessage(
-                                         method_name='BATCH_READ',
-                                         payload=json.dumps({
-                                             'device_address': self.config.target_address,
-                                             'read_specifications': point_map
-                                         }).encode('utf8'),
-                                         response_expected=True
-                                     )).get(timeout=self.config.timeout).decode('utf8')
-            # TODO: Check if this is an AsyncResult before calling get().
-            #_log.debug(f"RESPONSE IS: {response}")
-            response = json.loads(response)
-            result_dict = response.get('result', {})
-            error_dict = response.get('error', {})
+            for i in range(0, len(items), batch_size):
+                batch = dict(items[i:i + batch_size])
+                response = self.ppm.send(self.proxy_peer,
+                                         ProtocolProxyMessage(
+                                             method_name='BATCH_READ',
+                                             payload=json.dumps({
+                                                 'device_address': self.config.target_address,
+                                                 'read_specifications': batch
+                                             }).encode('utf8'),
+                                             response_expected=True
+                                         ))
+                result, errors = self.parse_proxy_response(response, batch.keys())
+                result_dict.update(result if isinstance(result, dict) else {})
+                error_dict.update(errors)
         except Timeout as e:
             _log.warning(f'Request timed out polling: {self.config.target_address}: {e}')
         except Exception as e:
             _log.warning(f'Unexpected error in get_multiple_points: {e}')
-        #_log.debug(f'RECEIVED ERROR: {error_dict}')
-        #_log.debug(f'RECEIVED RESULT: {result_dict}')
         return result_dict, error_dict
 
     def set_multiple_points(self, topics_values, **kwargs):
