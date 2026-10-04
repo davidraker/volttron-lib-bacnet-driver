@@ -22,6 +22,7 @@
 # ===----------------------------------------------------------------------===
 # }}}
 
+import builtins
 import json
 import logging
 
@@ -29,10 +30,11 @@ from math import ceil
 
 from collections.abc import Iterable, KeysView
 from datetime import datetime, timedelta
-from pydantic import AliasChoices, computed_field, Field, IPvAnyInterface
+from enum import Enum
+from pydantic import AliasChoices, computed_field, Field, IPvAnyInterface, field_validator, model_validator
 from typing import ClassVar, Annotated, Any, cast
 
-from volttron.driver.base.config import empty_str_is, PointConfig, RemoteConfig
+from volttron.driver.base.config import DataSource, empty_str_is, PointConfig, RemoteConfig
 from volttron.driver.base.driver_exceptions import DriverConfigError
 from volttron.driver.base.interfaces import BaseInterface, BaseRegister, DriverInterfaceError
 from volttron.driver.base.proxy_interface import ProxyBackedInterface
@@ -53,6 +55,20 @@ BACNET_TYPE_MAPPING = {  # TODO: Update with additional types.
 }
 
 
+#: Object types a peer may command on a served device unless the row says otherwise; inputs are read-only by convention.
+COMMANDABLE_OBJECT_TYPES = frozenset({'analogOutput', 'analogValue', 'binaryOutput', 'binaryValue', 'multiStateOutput',
+                                      'multiStateValue'})
+
+
+class DriverRole(str, Enum):
+    """Which side of BACnet this remote is. ``master``/``outstation``/``slave`` are accepted spellings as well."""
+    client = 'client'
+    server = 'server'
+
+
+ROLE_ALIASES = {'master': 'client', 'outstation': 'server', 'slave': 'server'}
+
+
 class BacnetPointConfig(PointConfig):
     array_index: Annotated[int | None, empty_str_is(None)] = None
     object_type: str = Field(validation_alias=AliasChoices('object_type', 'Object Type','BACnet Object Type', 'bacnet_object_type'))
@@ -60,9 +76,27 @@ class BacnetPointConfig(PointConfig):
     instance: int = Field(validation_alias=AliasChoices('instance','Instance', 'Index', 'index'))
     cov_flag: Annotated[bool, empty_str_is(False)] = Field(default=False, alias='COV Flag')
     write_priority: Annotated[int, empty_str_is(16)] = Field(default=16, ge=1, le=16, alias='Write Priority')
+    # Served devices: the value the object holds until something writes it, the state count of a multi-state object,
+    # the COV increment of an analog object and the object's name on the network (the point name when blank).
+    default_value: Any = Field(default=None, validation_alias=AliasChoices('default_value', 'Default Value', 'Starting Value'))
+    number_of_states: Annotated[int, empty_str_is(2)] = Field(default=2, ge=1, validation_alias=AliasChoices('number_of_states', 'Number Of States'))
+    cov_increment: Annotated[float | None, empty_str_is(None)] = Field(default=None, validation_alias=AliasChoices('cov_increment', 'COV Increment'))
+    object_name: str = Field(default='', validation_alias=AliasChoices('object_name', 'Object Name'))
+
+    # ``property`` is a field of this model, so the decorator comes from builtins.
+    @builtins.property
+    def is_served(self) -> bool:
+        """A served point (``data_source: server``) of a device this driver serves."""
+        return self.data_source is DataSource.SERVER
+
+    @builtins.property
+    def resolved_remote_writable(self) -> bool:
+        """Whether a peer may command this served object: as configured, else when it is an output or value object."""
+        return self.remote_writable if self.remote_writable is not None else self.object_type in COMMANDABLE_OBJECT_TYPES
 
 
 class BacnetRemoteConfig(RemoteConfig):
+    driver_role: DriverRole = DriverRole.client
     # TODO: Confirm this is not needed now that it is added to superclass: model_config = ConfigDict(populate_by_name=True)
     bacnet_port_configured: int = Field(default=0, alias='bacnet_port')
     cov_lifetime_configured: float = Field(default=180.0, alias='cov_lifetime')  # TODO: Can this by by point instead?
@@ -72,7 +106,12 @@ class BacnetRemoteConfig(RemoteConfig):
     min_priority: int = Field(default=8, ge=1, le=16)
     ping_retry_interval_configured: float = Field(alias='ping_retry_interval', default=5.0)
     time_synchronization_seconds: float | None = Field(default=None, ge=0, alias='time_synchronization_interval')
-    target_address: str = Field(alias="device_address")
+    # Client role: the device to reach. Required in that role.
+    target_address: str | None = Field(default=None, alias="device_address")
+    # Server role: the UDP port the served device answers on (an offset from 47808, or an absolute port; it must differ
+    # from this proxy's bacnet_port), and the served device object's name.
+    served_port: int | None = Field(default=None, ge=0)
+    object_name: str = 'VOLTTRON served device'
     # Device-level: how long the proxy waits for this device to answer one request, and how often it retries.
     # These configure the shared proxy process for this local interface; the first device to launch it wins.
     apdu_timeout: float = Field(default=3.0, gt=0)
@@ -103,6 +142,46 @@ class BacnetRemoteConfig(RemoteConfig):
     def reply_timeout(self) -> float:
         """Driver-side wait for the proxy's reply; strictly longer than the proxy's batch limit."""
         return self.timeout if self.timeout is not None else self.batch_read_timeout + self.REPLY_MARGIN
+
+    @field_validator('driver_role', mode='before')
+    @classmethod
+    def _role(cls, v):
+        if isinstance(v, str):
+            v = v.lower().strip() or 'client'
+            return ROLE_ALIASES.get(v, v)
+        return DriverRole.client if v is None else v
+
+    @model_validator(mode='after')
+    def _check_role_fields(self):
+        if self.driver_role is DriverRole.client and not self.target_address:
+            raise ValueError('A BACnet client needs the device_address of the device to reach.')
+        if self.driver_role is DriverRole.server:
+            if self.served_port is None:
+                raise ValueError('A served BACnet device needs served_port, a UDP port of its own.')
+            if self.resolved_served_port == self.resolved_proxy_port:
+                raise ValueError('served_port must differ from bacnet_port: the proxy already answers on that port.')
+        return self
+
+    @property
+    def is_server(self) -> bool:
+        return self.driver_role is DriverRole.server
+
+    @staticmethod
+    def _udp_port(port: int) -> int:
+        return port if port >= 1024 else 47808 + port
+
+    @property
+    def resolved_proxy_port(self) -> int:
+        return self._udp_port(self.bacnet_port_configured)
+
+    @property
+    def resolved_served_port(self) -> int:
+        return self._udp_port(self.served_port or 0)
+
+    def served_fields(self) -> dict:
+        """What REGISTER_REMOTE needs to serve the device, besides the point table."""
+        return {'role': 'server', 'local_interface': str(self.local_interface), 'port': self.resolved_served_port,
+                'device_id': self.device_id, 'object_name': self.object_name}
 
     def proxy_key(self) -> tuple:
         """Selects the proxy process: one per local interface and port."""
@@ -180,14 +259,32 @@ class BACnetRegister(BaseRegister):
         self.array_index = list_index
         self.python_type = BACNET_TYPE_MAPPING[object_type]
         self.is_cov = is_cov
+        # Served devices only.
+        self.remote_writable = False
+        self.initial_value: Any = None
+        self.number_of_states = 2
+        self.cov_increment: float | None = None
+        self.object_name = ''
+
+    def served_fields(self, topic: str) -> dict:
+        """This register's entry in a served device's point table."""
+        return {'topic': topic, 'object_type': self.object_type, 'instance': self.instance_number, 'property': self.property,
+                'units': self.units, 'remote_writable': self.remote_writable, 'initial_value': self.initial_value,
+                'number_of_states': self.number_of_states, 'cov_increment': self.cov_increment, 'object_name': self.object_name}
 
 
 class BACnet(ProxyBackedInterface, BaseInterface):
-    """Platform Driver interface for a BACnet device, served by the BACnet Protocol Proxy.
+    """Platform Driver interface for a BACnet device, served by the BACnet Protocol Proxy, in either role.
 
-    BACnet has no registration message: the proxy is launched with the local interface settings, the device is
-    reached with a directed WhoIs, and each change-of-value point is subscribed to. Reads batch by
-    ``max_per_request``; writes are one WriteProperty per point with a priority.
+    Client role (the default): BACnet has no registration message; the proxy is launched with the local interface
+    settings, the device is reached with a directed WhoIs, and each change-of-value point is subscribed to. Reads
+    batch by ``max_per_request``; writes are one WriteProperty per point with a priority.
+
+    Server role (``driver_role: server``): the registry rows are objects of a BACnet device the proxy serves on
+    ``served_port`` (REGISTER_REMOTE). ``set_point`` sets an object's present value and reflects it into the
+    equipment tree at once, ``get_multiple_points`` reports what the proxy holds (READ_POINTS, WRITE_POINTS by topic),
+    and a peer's accepted writes to ``Remote Writable`` objects (outputs and values by default) arrive as pushes.
+    Served rows default to ``data_source: server``, so they are never polled.
     """
 
     REGISTER_CONFIG_CLASS = BacnetPointConfig
@@ -201,7 +298,13 @@ class BACnet(ProxyBackedInterface, BaseInterface):
         self.register_count_divisor = 1
         self.scheduled_ping = None
         self.time_synchronization_active = False
+        if self.config.is_server:
+            self.REGISTER_METHOD, self.READ_METHOD, self.WRITE_METHOD = 'REGISTER_REMOTE', 'READ_POINTS', 'WRITE_POINTS'
         self.init_proxy()
+
+    @property
+    def is_server(self) -> bool:
+        return self.config.is_server
 
     @property
     def register_count(self):
@@ -209,12 +312,40 @@ class BACnet(ProxyBackedInterface, BaseInterface):
 
     # ---- the proxy exchange, in BACnet terms ------------------------------------------------------------------
     def identity_fields(self) -> dict:
+        if self.is_server:
+            return self.config.served_fields()
         return {'device_address': self.config.target_address}
 
     def proxy_launch_options(self) -> dict:
         return self.config.proxy_launch_options()
 
+    def prepare_registry_config(self, registry_config: list[dict], remote_config: RemoteConfig | None = None) -> list[dict]:
+        """In the server role, rows default to the ``server`` data source and to being writable by the platform."""
+        role = getattr(remote_config, 'driver_role', None) if remote_config is not None else self.config.driver_role
+        role = getattr(role, 'value', role)
+        if ROLE_ALIASES.get(role, role) != DriverRole.server.value:
+            return registry_config
+        prepared = []
+        for row in registry_config:
+            row = dict(row)
+            if all(row.get(key) in (None, '') for key in ('data_source', 'Data Source')):
+                row['data_source'] = 'server'
+            if all(row.get(key) in (None, '') for key in ('writable', 'Writable')):
+                row['writable'] = True
+            prepared.append(row)
+        return prepared
+
+    def registration_payload(self) -> dict:
+        """The served device and its objects (server role only; a client sends no registration)."""
+        return {**self.config.served_fields(),
+                'points': [cast(BACnetRegister, register).served_fields(topic) for topic, register in self.point_map.items()],
+                'values': self.tree_values()}
+
     def after_registration(self, result: dict, initial_setup: bool):
+        if self.is_server:
+            _log.info(f"BACnet device {self.config.device_id} is served on {self.config.local_interface}:{result.get('port')} by"
+                      f" the proxy as {result.get('server')} with {result.get('points')} objects.")
+            return
         # TODO: finalize_setup is called after every device is added. If this is an issue, we would need a different
         #  hook; it could be called on every remote after the end of a setup loop, possibly?
         if initial_setup:
@@ -229,21 +360,50 @@ class BACnet(ProxyBackedInterface, BaseInterface):
                                               register, topic, self.config.cov_lifetime)
 
     def create_register(self, register_definition: BacnetPointConfig) -> BACnetRegister:
-        if register_definition.write_priority < self.config.min_priority:
+        if not self.is_server and register_definition.write_priority < self.config.min_priority:
             raise DriverConfigError(
                 f"{register_definition.volttron_point_name} configured with a priority"
                 f" {register_definition.write_priority} which is lower than than minimum {self.config.min_priority}.")
 
-        return BACnetRegister(register_definition.instance,
-                              register_definition.object_type,
-                              register_definition.property,
-                              register_definition.writable is False,
-                              register_definition.volttron_point_name,
-                              register_definition.units,
-                              description=register_definition.notes,
-                              priority=register_definition.write_priority,
-                              list_index=register_definition.array_index,
-                              is_cov=register_definition.cov_flag)
+        register = BACnetRegister(register_definition.instance,
+                                  register_definition.object_type,
+                                  register_definition.property,
+                                  register_definition.writable is False,
+                                  register_definition.volttron_point_name,
+                                  register_definition.units,
+                                  description=register_definition.notes,
+                                  priority=register_definition.write_priority,
+                                  list_index=register_definition.array_index,
+                                  is_cov=register_definition.cov_flag)
+        if register_definition.is_served:
+            register.remote_writable = register_definition.resolved_remote_writable
+            register.number_of_states, register.cov_increment = register_definition.number_of_states, register_definition.cov_increment
+            register.object_name = register_definition.object_name
+            if register_definition.default_value not in (None, ''):
+                try:
+                    register.initial_value = self._coerce(register, register_definition.default_value)
+                except (TypeError, ValueError):
+                    _log.warning(f"Starting value {register_definition.default_value!r} for {register.point_name} is not usable;"
+                                 " the object starts empty.")
+        return register
+
+    @staticmethod
+    def _coerce(register: BACnetRegister, value: Any):
+        python_type = register.python_type
+        if python_type is bool:
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text in ('true', 't', 'on', 'yes', '1', 'active'):
+                    return True
+                if text in ('false', 'f', 'off', 'no', '0', '', 'inactive'):
+                    return False
+                raise ValueError(f'{value!r} is not a boolean')
+            return bool(value)
+        if python_type is int:
+            return int(value, 0) if isinstance(value, str) else int(value)
+        if isinstance(value, bool):
+            raise TypeError('a boolean is not a number')
+        return float(value)
 
     def schedule_ping(self):
         if self.scheduled_ping is None:
@@ -290,7 +450,10 @@ class BACnet(ProxyBackedInterface, BaseInterface):
                 'property_array_index': register.array_index}
 
     def get_point(self, topic: str, on_property: str = None):
-        """One ReadProperty (BATCH_READ is for polls): any property of the point's object, not only the configured one."""
+        """One ReadProperty (BATCH_READ is for polls): any property of the point's object, not only the configured one.
+        On a served device, the object's present value as the proxy holds it."""
+        if self.is_server:
+            return ProxyBackedInterface.get_point(self, topic)
         self._require_peer()
         register: BACnetRegister = cast(BACnetRegister, self.get_register_by_name(topic))
         response = self._send('READ_PROPERTY', self._property_payload(register, on_property))
@@ -298,6 +461,12 @@ class BACnet(ProxyBackedInterface, BaseInterface):
 
     def set_point(self, topic, value, priority=None, on_property=None):
         # TODO: support writing from an array.
+        if self.is_server:
+            register = cast(BACnetRegister, self.point_map[topic])
+            results, errors = self.proxy_write([(topic, self._coerce(register, value))])
+            if topic not in results:
+                raise IOError(f'Error writing point {topic}: {errors.get(topic, errors)}')
+            return results[topic]
         register: BACnetRegister = cast(BACnetRegister, self.get_register_by_name(topic))
         if register.read_only:
             raise IOError("Trying to write to a point configured read only: " + topic)
@@ -317,7 +486,10 @@ class BACnet(ProxyBackedInterface, BaseInterface):
                 'property': reg.property, 'array_index': reg.array_index}
 
     def split_reads(self, topics: list[str], **kwargs) -> list[tuple[dict, list[str]]]:
-        """BATCH_READ requests of at most ``max_per_request`` points (0: everything in one)."""
+        """BATCH_READ requests of at most ``max_per_request`` points (0: everything in one); a served device is read
+        by topic in one request."""
+        if self.is_server:
+            return ProxyBackedInterface.split_reads(self, topics, **kwargs)
         # TODO: support reading from an array.
         # TODO: max_per_request could probably be detected from the device rather than only configured.
         batch_size = self.config.max_per_request if self.config.max_per_request > 0 else len(topics)
@@ -329,12 +501,21 @@ class BACnet(ProxyBackedInterface, BaseInterface):
         return batches
 
     def split_writes(self, items: list[tuple[str, Any]], priority=None, on_property=None, **kwargs):
-        """One WRITE_PROPERTY per point until the proxy supports WritePropertyMultiple."""
+        """One WRITE_PROPERTY per point until the proxy supports WritePropertyMultiple; a served device takes every
+        value by topic in one request."""
+        if self.is_server:
+            return ProxyBackedInterface.split_writes(self, items, **kwargs)
         return [(self._write_payload(cast(BACnetRegister, self.point_map[topic]), value, priority, on_property), [(topic, value)])
                 for topic, value in items]
 
     def interpret_write(self, items: list[tuple[str, Any]], result: Any, request_errors: Any) -> tuple[dict, dict]:
-        """A WriteProperty acknowledgement carries no value: the reply is the (possibly None) result or an error."""
+        """A WriteProperty acknowledgement carries no value: the reply is the (possibly None) result or an error. A
+        served device answers by topic; its stored values are reflected into the equipment tree at once."""
+        if self.is_server:
+            results, errors = ProxyBackedInterface.interpret_write(self, items, result, request_errors)
+            if results:
+                self.driver_agent.publish_push(dict(results))
+            return results, errors
         [(topic, _)] = items
         if isinstance(request_errors, dict) and request_errors:
             return {}, {topic: str(request_errors.get(topic, request_errors))}
@@ -355,8 +536,14 @@ class BACnet(ProxyBackedInterface, BaseInterface):
 
     def revert_point(self, topic, priority=None):
         """
-        Revert point to its default state
+        Revert point to its default state: relinquish the command on a remote device; on a served device, restore the
+        row's starting value (a point without one is left as it is).
         """
+        if self.is_server:
+            register = cast(BACnetRegister, self.point_map[topic])
+            if register.initial_value is not None:
+                self.set_point(topic, register.initial_value)
+            return
         # TODO: Should this have a way to set the revert value to something other than None (e.g., for UCSD's lights)?
         self.set_point(topic, None, priority=priority)
 
@@ -388,4 +575,6 @@ class BACnet(ProxyBackedInterface, BaseInterface):
     @classmethod
     def unique_remote_id(cls, config_name: str, config: RemoteConfig) -> tuple:
         bacnet_config = cls.INTERFACE_CONFIG_CLASS(**config.model_dump())
+        if bacnet_config.is_server:
+            return 'bacnet', 'server', str(bacnet_config.local_interface), bacnet_config.resolved_served_port, bacnet_config.device_id
         return bacnet_config.target_address, bacnet_config.device_id

@@ -24,7 +24,7 @@ def ppm():
 
 @pytest.fixture
 def driver_agent():
-    agent = mock.Mock()
+    agent = mock.Mock(equipment_model=None)
     agent.tz = 'UTC'
     agent.core.schedule.return_value = 'scheduled'
     return agent
