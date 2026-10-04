@@ -381,7 +381,8 @@ class BACnet(ProxyBackedInterface, BaseInterface):
             'monitored_object_identifier': ':'.join([str(register.object_type), str(register.instance_number)]),
             'property_identifier': register.property,
             'issue_confirmed_notifications': True,  # TODO: Should this be exposed somewhere in case only unconfirmed notifications are supported?
-            'lifetime': lifetime.total_seconds()
+            'lifetime': lifetime.total_seconds(),
+            'remote_id': self.remote_id.hex                 # the proxy tags this subscription's RECEIVE_COV pushes with it
         }, response_expected=False)
 
     @classmethod

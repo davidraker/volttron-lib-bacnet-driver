@@ -89,7 +89,7 @@ class TestSetup:
         cov = ppm.payloads('SETUP_COV')[0]
         assert cov == {'subscription_key': TOPIC('Temp'), 'device_address': '10.0.0.5',
                        'monitored_object_identifier': 'analogInput:1', 'property_identifier': 'present-value',
-                       'issue_confirmed_notifications': True, 'lifetime': 180.0}
+                       'issue_confirmed_notifications': True, 'lifetime': 180.0, 'remote_id': interface.remote_id.hex}
         assert [e for _, _, e in ppm.sent] == [False, False]                             # fire-and-forget
 
     def test_finalize_setup_without_initial_flag_skips_ping(self, interface, ppm):
