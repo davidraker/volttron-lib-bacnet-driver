@@ -194,16 +194,16 @@ class TestReadsAndWrites:
 
 
 class TestCOV:
-    def test_receive_cov_publishes_values(self, interface, driver_agent):
+    def test_receive_push_publishes_values(self, interface, driver_agent):
         raw = json.dumps({'result': {TOPIC('Temp'): 70.5}, 'error': {}}).encode('utf8')
-        interface.receive_cov.__wrapped__(interface, None, raw)
+        interface.receive_push.__wrapped__(interface, None, raw)
         driver_agent.publish_push.assert_called_once_with({TOPIC('Temp'): 70.5})
 
-    def test_receive_cov_logs_errors_and_publishes_nothing(self, interface, driver_agent, caplog):
+    def test_receive_push_logs_errors_and_publishes_nothing(self, interface, driver_agent, caplog):
         raw = json.dumps({'result': {}, 'error': {TOPIC('Temp'): 'subscription failed'}}).encode('utf8')
         with caplog.at_level(logging.WARNING):
-            interface.receive_cov.__wrapped__(interface, None, raw)
-        assert 'Error received in COV push' in caplog.text and not driver_agent.publish_push.called
+            interface.receive_push.__wrapped__(interface, None, raw)
+        assert 'Error received with pushed values' in caplog.text and not driver_agent.publish_push.called
 
     def test_establish_cov_subscription_uses_lifetime_seconds(self, interface, ppm):
         from datetime import timedelta

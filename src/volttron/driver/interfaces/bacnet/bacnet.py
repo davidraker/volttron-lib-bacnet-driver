@@ -29,17 +29,13 @@ from math import ceil
 
 from collections.abc import Iterable, KeysView
 from datetime import datetime, timedelta
-from gevent import Timeout
-from gevent.event import AsyncResult
 from pydantic import AliasChoices, computed_field, Field, IPvAnyInterface
 from typing import ClassVar, Annotated, Any, cast
-
-from protocol_proxy.ipc import ProtocolProxyMessage, ProtocolProxyPeer, callback
-from protocol_proxy.manager.gevent import GeventProtocolProxyManager
 
 from volttron.driver.base.config import empty_str_is, PointConfig, RemoteConfig
 from volttron.driver.base.driver_exceptions import DriverConfigError
 from volttron.driver.base.interfaces import BaseInterface, BaseRegister, DriverInterfaceError
+from volttron.driver.base.proxy_interface import ProxyBackedInterface
 
 _log = logging.getLogger(__name__)
 
@@ -107,6 +103,10 @@ class BacnetRemoteConfig(RemoteConfig):
     def reply_timeout(self) -> float:
         """Driver-side wait for the proxy's reply; strictly longer than the proxy's batch limit."""
         return self.timeout if self.timeout is not None else self.batch_read_timeout + self.REPLY_MARGIN
+
+    def proxy_key(self) -> tuple:
+        """Selects the proxy process: one per local interface and port."""
+        return str(self.local_interface), self.bacnet_port
 
     def proxy_launch_options(self) -> dict:
         return {'local_interface': str(self.local_interface), 'bacnet_port': self.bacnet_port,
@@ -182,37 +182,43 @@ class BACnetRegister(BaseRegister):
         self.is_cov = is_cov
 
 
-class BACnet(BaseInterface):
+class BACnet(ProxyBackedInterface, BaseInterface):
+    """Platform Driver interface for a BACnet device, served by the BACnet Protocol Proxy.
+
+    BACnet has no registration message: the proxy is launched with the local interface settings, the device is
+    reached with a directed WhoIs, and each change-of-value point is subscribed to. Reads batch by
+    ``max_per_request``; writes are one WriteProperty per point with a priority.
+    """
 
     REGISTER_CONFIG_CLASS = BacnetPointConfig
     INTERFACE_CONFIG_CLASS = BacnetRemoteConfig
+    PROXY_NAME, PROXY_LABEL = 'bacnet', 'BACnet Proxy'
+    REGISTER_METHOD = None
+    READ_METHOD, WRITE_METHOD, PUSH_METHOD = 'BATCH_READ', 'WRITE_PROPERTY', 'RECEIVE_COV'
 
     def __init__(self, config, *args, **kwargs):
         super(BACnet, self).__init__(config, *args, **kwargs)
         self.register_count_divisor = 1
-
-        self.ppm: GeventProtocolProxyManager = GeventProtocolProxyManager.get_manager('bacnet')  # '(BACnetProxy)
-        self.proxy_peer: ProtocolProxyPeer | None = None
         self.scheduled_ping = None
         self.time_synchronization_active = False
-
-        self.ppm.register_callback(self.receive_cov, 'RECEIVE_COV', provides_response=False)
-        self.ppm.start()
-        self.driver_agent.core.spawn(self.ppm.select_loop)
+        self.init_proxy()
 
     @property
     def register_count(self):
         return sum([len(reg_group) for reg_group in self.registers.values()])
 
-    def finalize_setup(self, initial_setup: bool = False):
-        # TODO: This will be called after every device is added.  If this is an issue, we would need a different hook.
-        #  It could be called on every remote after the end of a setup loop, possibly?
-        #_log.debug('BACnet finalize_setup called.')
-        self.proxy_peer = self.ppm.get_proxy((str(self.config.local_interface), self.config.bacnet_port),
-                                             **self.config.proxy_launch_options())
-        _log.debug('BACnet finalize_setup: proxy_peer is: %s', self.proxy_peer)
+    # ---- the proxy exchange, in BACnet terms ------------------------------------------------------------------
+    def identity_fields(self) -> dict:
+        return {'device_address': self.config.target_address}
+
+    def proxy_launch_options(self) -> dict:
+        return self.config.proxy_launch_options()
+
+    def after_registration(self, result: dict, initial_setup: bool):
+        # TODO: finalize_setup is called after every device is added. If this is an issue, we would need a different
+        #  hook; it could be called on every remote after the end of a setup loop, possibly?
         if initial_setup:
-            self.ppm.wait_peer_registered(self.proxy_peer, self.config.registration_timeout, self.ping_target)
+            self.ping_target()
         # TODO: Consider adding a self.config.remote_refresh_interval to be scheduled as
         #  a periodic here to ping the target with a WhoIs.
         self.setup_time_synchronization()
@@ -253,16 +259,9 @@ class BACnet(BaseInterface):
 
         pinged = False
         try:
-            self.ppm.send(self.proxy_peer,
-                         ProtocolProxyMessage(
-                             method_name='WHO_IS',
-                             payload=json.dumps({
-                                 'device_instance_low': self.config.device_id,
-                                 'device_instance_high': self.config.device_id,
-                                 'dest': self.config.target_address
-                             }).encode('utf8'),
-                            response_expected=False
-                         ))
+            self._send('WHO_IS', {'device_instance_low': self.config.device_id,
+                                  'device_instance_high': self.config.device_id,
+                                  'dest': self.config.target_address}, response_expected=False)
             pinged = True
         # TODO: What exceptions might we really encounter, now, through PPM?
         except Exception as e:
@@ -272,36 +271,6 @@ class BACnet(BaseInterface):
         # Schedule retry.
         if not pinged:
             self.schedule_ping()
-
-    def parse_proxy_response(self, response: Any, error_keys: Iterable[str]) -> tuple[Any, dict]:
-        """Normalize a reply from the BACnet Proxy into ``(result, errors)``.
-
-        ``ProtocolProxyManager.send`` returns an AsyncResult when a response is expected, or False when the
-        request could not be sent (e.g., the proxy process has not registered). The proxy itself replies with
-        ``{'result': ..., 'error': {...}}`` from its serializer, with ``{'status': 'error', 'error': ..., 'method': ...}``
-        when the endpoint raised or timed out, or with an empty body when the endpoint returned nothing.
-        Whole-request failures are reported against every key in ``error_keys`` (normally the affected topics).
-        A gevent Timeout waiting on the AsyncResult is left to propagate to the caller.
-        """
-        error_keys = list(error_keys)
-
-        def failed(message: str) -> tuple[dict, dict]:
-            return {}, {key: message for key in error_keys}
-
-        if not isinstance(response, AsyncResult):
-            return failed(f'Unable to send request to BACnet Proxy (send returned {response!r}).')
-        raw = response.get(timeout=self.config.reply_timeout)
-        if not raw:
-            return failed('Empty response from BACnet Proxy.')
-        try:
-            payload = json.loads(raw.decode('utf8'))
-        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as e:
-            return failed(f'Undecodable response from BACnet Proxy: {e}')
-        if not isinstance(payload, dict):
-            return failed(f'Unexpected response from BACnet Proxy: {payload!r}')
-        if payload.get('status') == 'error':
-            return failed(f"BACnet Proxy {payload.get('method', 'request')} failed: {payload.get('error')}")
-        return payload.get('result', {}), payload.get('error') or {}
 
     def _parse_scalar_response(self, response: Any, topic: str, operation: str) -> Any:
         result, errors = self.parse_proxy_response(response, [topic])
@@ -314,21 +283,17 @@ class BACnet(BaseInterface):
         _log.warning(msg)
         raise RuntimeError(msg)
 
+    def _property_payload(self, register: BACnetRegister, on_property: str | None) -> dict:
+        return {'device_address': self.config.target_address,
+                'object_identifier': f'{register.object_type}, {register.instance_number}',
+                'property_identifier': on_property if on_property else register.property,
+                'property_array_index': register.array_index}
+
     def get_point(self, topic: str, on_property: str = None):
-        if self.proxy_peer is None:
-            raise DriverInterfaceError("BACnet interface not initialized.  No proxy peer available.")
+        """One ReadProperty (BATCH_READ is for polls): any property of the point's object, not only the configured one."""
+        self._require_peer()
         register: BACnetRegister = cast(BACnetRegister, self.get_register_by_name(topic))
-        response = self.ppm.send(self.proxy_peer,
-                             ProtocolProxyMessage(
-                                 method_name='READ_PROPERTY',
-                                 payload=json.dumps({
-                                     'device_address': self.config.target_address,
-                                     'object_identifier': f'{register.object_type}, {register.instance_number}',
-                                     'property_identifier': on_property if on_property else register.property,
-                                     'property_array_index': register.array_index
-                                 }).encode('utf8'),
-                                 response_expected=True
-                             ))
+        response = self._send('READ_PROPERTY', self._property_payload(register, on_property))
         return self._parse_scalar_response(response, topic, 'reading')
 
     def set_point(self, topic, value, priority=None, on_property=None):
@@ -336,65 +301,44 @@ class BACnet(BaseInterface):
         register: BACnetRegister = cast(BACnetRegister, self.get_register_by_name(topic))
         if register.read_only:
             raise IOError("Trying to write to a point configured read only: " + topic)
-
         if priority is not None and priority < self.config.min_priority:
             raise IOError("Trying to write with a priority lower than the minimum of " +
                           str(self.config.min_priority))
-
-        response = self.ppm.send(self.proxy_peer,
-                             ProtocolProxyMessage(
-                                 method_name='WRITE_PROPERTY',
-                                 payload=json.dumps({
-                                     'device_address': self.config.target_address,
-                                     'object_identifier': f'{register.object_type}, {register.instance_number}',
-                                     'property_identifier': on_property if on_property else register.property,
-                                     'value': value,
-                                     'priority': priority if priority is not None else register.priority,
-                                     'property_array_index': register.array_index
-                                 }).encode('utf8'),
-                                 response_expected=True
-                             ))
+        response = self._send('WRITE_PROPERTY', self._write_payload(register, value, priority, on_property))
         return self._parse_scalar_response(response, topic, 'writing')
+
+    def _write_payload(self, register: BACnetRegister, value, priority=None, on_property=None) -> dict:
+        return {**self._property_payload(register, on_property), 'value': value,
+                'priority': priority if priority is not None else register.priority}
 
     @staticmethod
     def _query_fields(reg: BacnetPointConfig):
         return {'object_id': f'{reg.object_type}, {reg.instance_number}',
                 'property': reg.property, 'array_index': reg.array_index}
 
-    def get_multiple_points(self, topics: KeysView[str], **kwargs) -> tuple[dict, dict]:
+    def split_reads(self, topics: list[str], **kwargs) -> list[tuple[dict, list[str]]]:
+        """BATCH_READ requests of at most ``max_per_request`` points (0: everything in one)."""
         # TODO: support reading from an array.
-        # TODO: Manner of packing and unpacking this request needs to be rethought.
-        point_map = {t: self._query_fields(self.point_map[t]) for t in topics if t in self.point_map}
-        result_dict, error_dict = {}, {}
-        if not point_map:
-            return result_dict, error_dict
         # TODO: max_per_request could probably be detected from the device rather than only configured.
-        batch_size = self.config.max_per_request if self.config.max_per_request > 0 else len(point_map)
-        items = list(point_map.items())
-        try:
-            for i in range(0, len(items), batch_size):
-                batch = dict(items[i:i + batch_size])
-                response = self.ppm.send(self.proxy_peer,
-                                         ProtocolProxyMessage(
-                                             method_name='BATCH_READ',
-                                             payload=json.dumps({
-                                                 'device_address': self.config.target_address,
-                                                 'read_specifications': batch
-                                             }).encode('utf8'),
-                                             response_expected=True
-                                         ))
-                result, errors = self.parse_proxy_response(response, batch.keys())
-                result_dict.update(result if isinstance(result, dict) else {})
-                error_dict.update(errors)
-        except Timeout as e:
-            _log.warning(f'Request timed out polling: {self.config.target_address}: {e}')
-        except Exception as e:
-            _log.warning(f'Unexpected error in get_multiple_points: {e}')
-        return result_dict, error_dict
+        batch_size = self.config.max_per_request if self.config.max_per_request > 0 else len(topics)
+        batches = []
+        for i in range(0, len(topics), batch_size):
+            batch = topics[i:i + batch_size]
+            batches.append(({'device_address': self.config.target_address,
+                             'read_specifications': {t: self._query_fields(self.point_map[t]) for t in batch}}, batch))
+        return batches
 
-    def set_multiple_points(self, topics_values, **kwargs):
-        # TODO: Implement SET_PROPERTY_MULTIPLE in BACnetProtocolProxy
-        return super(BACnet, self).set_multiple_points(topics_values, **kwargs)
+    def split_writes(self, items: list[tuple[str, Any]], priority=None, on_property=None, **kwargs):
+        """One WRITE_PROPERTY per point until the proxy supports WritePropertyMultiple."""
+        return [(self._write_payload(cast(BACnetRegister, self.point_map[topic]), value, priority, on_property), [(topic, value)])
+                for topic, value in items]
+
+    def interpret_write(self, items: list[tuple[str, Any]], result: Any, request_errors: Any) -> tuple[dict, dict]:
+        """A WriteProperty acknowledgement carries no value: the reply is the (possibly None) result or an error."""
+        [(topic, _)] = items
+        if isinstance(request_errors, dict) and request_errors:
+            return {}, {topic: str(request_errors.get(topic, request_errors))}
+        return {topic: result if result != {} else None}, {}
 
     def revert_all(self, priority=None):
         """
@@ -419,17 +363,10 @@ class BACnet(BaseInterface):
     def setup_time_synchronization(self):
         interval = self.config.time_synchronization_interval
         if interval is not None or self.time_synchronization_active:
-            interval_seconds =  interval.total_seconds() if interval else None
-            self.ppm.send(self.proxy_peer,
-                          ProtocolProxyMessage(
-                              method_name='SETUP_TIME_SYNCHRONIZATION',
-                              payload=json.dumps({
-                                  'device_address': self.config.target_address,
-                                  'interval': interval_seconds,
-                                  'time_zone': self.driver_agent.tz
-                              }).encode('utf8'),
-                              response_expected=False
-                          ))
+            interval_seconds = interval.total_seconds() if interval else None
+            self._send('SETUP_TIME_SYNCHRONIZATION', {'device_address': self.config.target_address,
+                                                      'interval': interval_seconds, 'time_zone': self.driver_agent.tz},
+                       response_expected=False)
             self.time_synchronization_active = False if interval is None else True
 
     def establish_cov_subscription(self, register, topic, lifetime):
@@ -438,31 +375,14 @@ class BACnet(BaseInterface):
         If lifetime is specified, the subscription will be renewed by the proxy on
          that interval, else the subscription will last indefinitely.
         """
-        self.ppm.send(
-            self.proxy_peer,
-            ProtocolProxyMessage(
-                method_name='SETUP_COV',
-                payload=json.dumps({
-                    'subscription_key': topic,
-                    'device_address': self.config.target_address,
-                    'monitored_object_identifier': ':'.join([str(register.object_type), str(register.instance_number)]),
-                    'property_identifier': register.property,
-                    'issue_confirmed_notifications': True,  # TODO: Should this be exposed somewhere in case only unconfirmed notifications are supported?
-                    'lifetime': lifetime.total_seconds()
-                }).encode('utf8'),
-                response_expected=False
-                ))
-
-    @callback
-    def receive_cov(self, _, raw_message: bytes):
-        # TODO: Validation and error handling.
-        #_log.debug('@@@@@@@@@ IN RECEIVE_COV')
-        message = json.loads(raw_message.decode('utf8'))
-        #_log.debug(f'@@@@@@@@@ Received COV message: {message}')
-        if error := message.get('error', []):
-            _log.warning(f'Error received in COV push: {error}')
-        if result := message.get('result', {}):
-            self.driver_agent.publish_push(result)
+        self._send('SETUP_COV', {
+            'subscription_key': topic,
+            'device_address': self.config.target_address,
+            'monitored_object_identifier': ':'.join([str(register.object_type), str(register.instance_number)]),
+            'property_identifier': register.property,
+            'issue_confirmed_notifications': True,  # TODO: Should this be exposed somewhere in case only unconfirmed notifications are supported?
+            'lifetime': lifetime.total_seconds()
+        }, response_expected=False)
 
     @classmethod
     def unique_remote_id(cls, config_name: str, config: RemoteConfig) -> tuple:
