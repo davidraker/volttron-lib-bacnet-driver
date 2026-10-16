@@ -187,6 +187,33 @@ class TestReadsAndWrites:
             interface.revert_all()
         assert len(ppm.payloads('WRITE_PROPERTY')) == 2 and 'Error while reverting point' in caplog.text
 
+    def test_get_multiple_points_on_property(self, interface, ppm):
+        """on_property applies to every point of a batch read, as it does for a single get_point; without it each
+        register's configured property is read."""
+        ppm.queue(serialized({TOPIC('Temp'): 70.0, TOPIC('Modes'): 'Auto'}))
+        interface.get_multiple_points([TOPIC('Temp'), TOPIC('Modes')])
+        specs = ppm.payloads('BATCH_READ')[-1]['read_specifications']
+        assert {t: s['property'] for t, s in specs.items()} == {TOPIC('Temp'): 'present-value',
+                                                               TOPIC('Modes'): 'state-text'}
+        ppm.queue(serialized({TOPIC('Temp'): 'Temp', TOPIC('Modes'): 'Modes'}))
+        results, errors = interface.get_multiple_points([TOPIC('Temp'), TOPIC('Modes')], on_property='object-name')
+        specs = ppm.payloads('BATCH_READ')[-1]['read_specifications']
+        assert all(s['property'] == 'object-name' for s in specs.values()) and len(specs) == 2
+        assert specs[TOPIC('Modes')]['array_index'] == 2     # other fields still come from the register
+        assert results == {TOPIC('Temp'): 'Temp', TOPIC('Modes'): 'Modes'} and errors == {}
+
+    def test_reads_ignore_write_only_keywords(self, interface, ppm):
+        """A confirming read after a write receives the write's keywords: on_property selects what to read back and
+        priority, meaningless for a read, is ignored rather than rejected."""
+        ppm.queue(serialized(66.0))
+        assert interface.get_point(TOPIC('Setpoint'), priority=12, on_property='relinquish-default') == 66.0
+        assert ppm.payloads('READ_PROPERTY')[-1]['property_identifier'] == 'relinquish-default'
+        ppm.queue(serialized({TOPIC('Setpoint'): 66.0}))
+        results, errors = interface.get_multiple_points([TOPIC('Setpoint')], priority=12,
+                                                        on_property='relinquish-default')
+        assert results == {TOPIC('Setpoint'): 66.0} and errors == {}
+        assert ppm.payloads('BATCH_READ')[-1]['read_specifications'][TOPIC('Setpoint')]['property'] == 'relinquish-default'
+
     def test_set_multiple_points_writes_each(self, interface, ppm):
         results, errors = interface.set_multiple_points([(TOPIC('Setpoint'), 65.0), (TOPIC('Temp'), 1.0)])
         assert results == {TOPIC('Setpoint'): None} and 'read only' in errors[TOPIC('Temp')]

@@ -449,9 +449,10 @@ class BACnet(ProxyBackedInterface, BaseInterface):
                 'property_identifier': on_property if on_property else register.property,
                 'property_array_index': register.array_index}
 
-    def get_point(self, topic: str, on_property: str = None):
+    def get_point(self, topic: str, on_property: str = None, **kwargs):
         """One ReadProperty (BATCH_READ is for polls): any property of the point's object, not only the configured one.
-        On a served device, the object's present value as the proxy holds it."""
+        On a served device, the object's present value as the proxy holds it. Other keywords (e.g. a write's
+        ``priority`` passed along to a confirming read) do not apply to a read and are ignored."""
         if self.is_server:
             return ProxyBackedInterface.get_point(self, topic)
         self._require_peer()
@@ -481,13 +482,15 @@ class BACnet(ProxyBackedInterface, BaseInterface):
                 'priority': priority if priority is not None else register.priority}
 
     @staticmethod
-    def _query_fields(reg: BacnetPointConfig):
+    def _query_fields(reg: BacnetPointConfig, on_property: str | None = None):
         return {'object_id': f'{reg.object_type}, {reg.instance_number}',
-                'property': reg.property, 'array_index': reg.array_index}
+                'property': on_property if on_property else reg.property, 'array_index': reg.array_index}
 
-    def split_reads(self, topics: list[str], **kwargs) -> list[tuple[dict, list[str]]]:
+    def split_reads(self, topics: list[str], on_property: str = None, **kwargs) -> list[tuple[dict, list[str]]]:
         """BATCH_READ requests of at most ``max_per_request`` points (0: everything in one); a served device is read
-        by topic in one request."""
+        by topic in one request. ``on_property`` reads that property instead of each register's configured one, as
+        get_point does for a single point; other keywords (e.g. a write's ``priority``) do not apply to a read and
+        are ignored."""
         if self.is_server:
             return ProxyBackedInterface.split_reads(self, topics, **kwargs)
         # TODO: support reading from an array.
@@ -497,7 +500,8 @@ class BACnet(ProxyBackedInterface, BaseInterface):
         for i in range(0, len(topics), batch_size):
             batch = topics[i:i + batch_size]
             batches.append(({'device_address': self.config.target_address,
-                             'read_specifications': {t: self._query_fields(self.point_map[t]) for t in batch}}, batch))
+                             'read_specifications': {t: self._query_fields(self.point_map[t], on_property)
+                                                     for t in batch}}, batch))
         return batches
 
     def split_writes(self, items: list[tuple[str, Any]], priority=None, on_property=None, **kwargs):
