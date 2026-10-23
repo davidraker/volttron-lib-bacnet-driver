@@ -121,7 +121,7 @@ class BacnetRemoteConfig(RemoteConfig):
     timeout: float | None = Field(default=None, ge=0)
     # How long to wait for the proxy process to start and register.
     registration_timeout: float = Field(default=30.0, gt=0)
-    persistent_connection: bool = Field(default=False, description='Keep one IPC connection to the proxy open for every'
+    persistent_connection: bool = Field(default=True, description='Keep one IPC connection to the proxy open for every'
                                         ' request and push instead of one connection per message.')
     use_read_multiple: bool = True
 
