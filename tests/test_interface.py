@@ -291,7 +291,7 @@ class TestServerRole:
         iface = make_interface(SERVED_POINTS, **SERVED)
         ppm.queue(serialized({'server': '127.0.0.1/32:47850:4242', 'points': 4, 'seeded': 0, 'port': 47850}))
         iface.finalize_setup(initial_setup=True)
-        assert ppm.launch == (('127.0.0.1/32', 3), iface.config.proxy_launch_options())
+        assert ppm.launch == (('127.0.0.1/32', 3), {**iface.config.proxy_launch_options(), 'persistent': True})
         (method, payload, _), = ppm.sent                                            # no WHO_IS, no SETUP_COV
         assert method == 'REGISTER_REMOTE'
         assert {k: v for k, v in payload.items() if k != 'points'} == {'role': 'server', 'local_interface': '127.0.0.1/32', 'port': 47850,
