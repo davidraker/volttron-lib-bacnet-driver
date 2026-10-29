@@ -96,34 +96,76 @@ class BacnetPointConfig(PointConfig):
 
 
 class BacnetRemoteConfig(RemoteConfig):
-    driver_role: DriverRole = DriverRole.client
+    driver_role: DriverRole = Field(default=DriverRole.client,
+                                    description='client reaches a BACnet device; server serves the registry as a '
+                                                'device of its own.',
+                                    json_schema_extra={'group': 'Device', 'order': 20})
     # TODO: Confirm this is not needed now that it is added to superclass: model_config = ConfigDict(populate_by_name=True)
-    bacnet_port_configured: int = Field(default=0, alias='bacnet_port')
-    cov_lifetime_configured: float = Field(default=180.0, alias='cov_lifetime')  # TODO: Can this by by point instead?
-    device_id: int = Field(ge=0)
-    local_interface: IPvAnyInterface = Field(default='0.0.0.0/32')  # TODO: We should attempt to discover the interface.
-    max_per_request: int = Field(ge=0, default=24)
-    min_priority: int = Field(default=8, ge=1, le=16)
-    ping_retry_interval_configured: float = Field(alias='ping_retry_interval', default=5.0)
-    time_synchronization_seconds: float | None = Field(default=None, ge=0, alias='time_synchronization_interval')
+    bacnet_port_configured: int = Field(default=0, alias='bacnet_port',
+                                        description="The proxy's UDP port; 0 means 47808.",
+                                        json_schema_extra={'group': 'Connection', 'advanced': True, 'order': 40})
+    cov_lifetime_configured: float = Field(default=180.0, alias='cov_lifetime',
+                                           description='Lifetime requested for change-of-value subscriptions.',
+                                           json_schema_extra={'group': 'Protocol and timing', 'advanced': True,
+                                                              'unit': 's', 'order': 130})  # TODO: Can this by by point instead?
+    device_id: int = Field(ge=0, description='The BACnet device instance number.',
+                           json_schema_extra={'group': 'Connection', 'order': 20})
+    # TODO: local_interface: we should attempt to discover the interface.
+    local_interface: IPvAnyInterface = Field(default='0.0.0.0/32',
+                                             description='The local interface (CIDR) the proxy binds.',
+                                             json_schema_extra={'group': 'Connection', 'order': 30})
+    max_per_request: int = Field(ge=0, default=24, description='Points per ReadPropertyMultiple request.',
+                                 json_schema_extra={'group': 'Protocol and timing', 'order': 70})
+    min_priority: int = Field(default=8, ge=1, le=16, description='Lowest BACnet write priority this device accepts.',
+                              json_schema_extra={'group': 'Protocol and timing', 'advanced': True, 'order': 90})
+    ping_retry_interval_configured: float = Field(alias='ping_retry_interval', default=5.0,
+                                                  json_schema_extra={'group': 'Protocol and timing', 'advanced': True,
+                                                                     'unit': 's', 'order': 140})
+    time_synchronization_seconds: float | None = Field(default=None, ge=0, alias='time_synchronization_interval',
+                                                       description='How often to send the device a time '
+                                                                   'synchronization; blank never.',
+                                                       json_schema_extra={'group': 'Protocol and timing',
+                                                                          'advanced': True, 'unit': 's', 'order': 150})
     # Client role: the device to reach. Required in that role.
-    target_address: str | None = Field(default=None, alias="device_address")
+    target_address: str | None = Field(default=None, alias='device_address', description='Client: the device to reach.',
+                                       json_schema_extra={'group': 'Connection',
+                                                          'show_when': {'driver_role': ['client', 'master']},
+                                                          'order': 10})
     # Server role: the UDP port the served device answers on (an offset from 47808, or an absolute port; it must differ
     # from this proxy's bacnet_port), and the served device object's name.
-    served_port: int | None = Field(default=None, ge=0)
-    object_name: str = 'VOLTTRON served device'
+    served_port: int | None = Field(default=None, ge=0,
+                                    description='Server: the UDP port the served device answers on (an offset from '
+                                                '47808 or an absolute port; must differ from bacnet_port).',
+                                    json_schema_extra={'group': 'Connection',
+                                                       'show_when': {'driver_role': ['server', 'slave', 'outstation']},
+                                                       'order': 50})
+    object_name: str = Field(default='VOLTTRON served device', description="Server: the served device object's name.",
+                             json_schema_extra={'group': 'Connection',
+                                                'show_when': {'driver_role': ['server', 'slave', 'outstation']},
+                                                'order': 60})
     # Device-level: how long the proxy waits for this device to answer one request, and how often it retries.
     # These configure the shared proxy process for this local interface; the first device to launch it wins.
-    apdu_timeout: float = Field(default=3.0, gt=0)
-    apdu_retries: int = Field(default=3, ge=0)
+    apdu_timeout: float = Field(default=3.0, gt=0,
+                                description='How long the proxy waits for this device to answer one request; the first '
+                                            'device to launch the shared proxy wins.',
+                                json_schema_extra={'group': 'Protocol and timing', 'unit': 's', 'order': 100})
+    apdu_retries: int = Field(default=3, ge=0, json_schema_extra={'group': 'Protocol and timing', 'order': 110})
     # Reply wait: how long to wait for the proxy's answer to a request. None derives it from the APDU settings and
     # max_per_request so that it always outlasts the proxy's own BATCH_READ limit.
-    timeout: float | None = Field(default=None, ge=0)
+    timeout: float | None = Field(default=None, ge=0,
+                                  description="How long to wait for the proxy's answer; blank derives it from the APDU "
+                                              'settings and max_per_request.',
+                                  json_schema_extra={'group': 'Protocol and timing', 'advanced': True, 'unit': 's',
+                                                     'order': 120})
     # How long to wait for the proxy process to start and register.
-    registration_timeout: float = Field(default=30.0, gt=0)
+    registration_timeout: float = Field(default=30.0, gt=0,
+                                        json_schema_extra={'group': 'Proxy', 'advanced': True, 'unit': 's',
+                                                           'order': 160})
     persistent_connection: bool = Field(default=True, description='Keep one IPC connection to the proxy open for every'
-                                        ' request and push instead of one connection per message.')
-    use_read_multiple: bool = True
+                                        ' request and push instead of one connection per message.',
+                                        json_schema_extra={'group': 'Proxy', 'advanced': True, 'order': 170})
+    use_read_multiple: bool = Field(default=True,
+                                    json_schema_extra={'group': 'Protocol and timing', 'advanced': True, 'order': 80})
 
     RPM_CHUNK_SIZE: ClassVar[int] = 10           # BatchRead's ReadPropertyMultiple chunk size
     SETUP_CYCLES: ClassVar[int] = 2              # Who-Is + protocol-services-supported on first contact
